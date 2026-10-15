@@ -11,6 +11,7 @@ interface WormConfig {
   twBorder: string;
   twText: string;
   colorCode: string;
+  koreanName: string;
 }
 
 const WORMS: WormConfig[] = [
@@ -21,6 +22,7 @@ const WORMS: WormConfig[] = [
     twBorder: "border-red-600",
     twText: "text-red-700",
     colorCode: "#ef4444",
+    koreanName: "빨간색",
   },
   {
     key: "orange",
@@ -29,6 +31,7 @@ const WORMS: WormConfig[] = [
     twBorder: "border-orange-600",
     twText: "text-orange-700",
     colorCode: "#f97316",
+    koreanName: "주황색",
   },
   {
     key: "yellow",
@@ -37,6 +40,7 @@ const WORMS: WormConfig[] = [
     twBorder: "border-yellow-500",
     twText: "text-yellow-700",
     colorCode: "#eab308",
+    koreanName: "노란색",
   },
   {
     key: "blue",
@@ -45,6 +49,7 @@ const WORMS: WormConfig[] = [
     twBorder: "border-blue-600",
     twText: "text-blue-700",
     colorCode: "#3b82f6",
+    koreanName: "파란색",
   },
 ];
 
@@ -59,13 +64,14 @@ interface WormState {
   alive: boolean;
   isPlayer: boolean;
   direction: Point;
-  won: boolean;
+  hasReachedGoal: boolean;
+  goalRank?: number;
 }
 
 interface SheetRecord {
   row?: number;
   timestamp: string; // 게임 시작 시간
-  name: string; // 사용자 이름
+  name: string; // 1등 도착한 색깔 (요청: 구글 시트의 name에 1등 도착 색깔 표시)
   arrival: string; // 도착 시간
   finishTime: string; // 도착에 걸린 시간
 }
@@ -90,19 +96,22 @@ export default function WormGame() {
   const [elapsedTime, setElapsedTime] = useState<number>(0);
   const [startTimeStr, setStartTimeStr] = useState<string>("");
   const [gameResult, setGameResult] = useState<{
-    winner: string;
-    isPlayerWin: boolean;
+    firstColorName: string;
+    playerRank: number;
+    isPlayerFirst: boolean;
     time: number;
     arrivalStr: string;
     startTimeStr: string;
   } | null>(null);
 
-  // References for loop & controls
+  // References
   const directionRef = useRef<Point>({ x: 1, y: 0 });
   const timerRef = useRef<NodeJS.Timeout | null>(null);
   const loopRef = useRef<NodeJS.Timeout | null>(null);
   const wormsRef = useRef<WormState[]>([]);
   const goalRef = useRef<Point>({ x: 18, y: 18 });
+  const firstArrivedColorRef = useRef<string | null>(null);
+  const arrivalCountRef = useRef<number>(0);
 
   wormsRef.current = worms;
   goalRef.current = goal;
@@ -135,7 +144,6 @@ export default function WormGame() {
 
     setIsClearing(true);
     try {
-      // 1. 개별 행 삭제 또는 action: clear 요청
       const res = await fetch("/api/records", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -143,7 +151,6 @@ export default function WormGame() {
       });
       const data = await res.json();
 
-      // 만약 GAS에 clear action이 미구현 상태인 경우 기존 레코드 순차 삭제 폴백
       if (!data.success && records.length > 0) {
         for (const rec of records) {
           if (rec.row) {
@@ -209,6 +216,8 @@ export default function WormGame() {
     setScreen("loading_path");
     setElapsedTime(0);
     directionRef.current = { x: 1, y: 0 };
+    firstArrivedColorRef.current = null;
+    arrivalCountRef.current = 0;
 
     const startFormatted = new Date().toLocaleTimeString("ko-KR", {
       hour: "2-digit",
@@ -248,7 +257,7 @@ export default function WormGame() {
           alive: true,
           isPlayer,
           direction: { x: 1, y: 0 },
-          won: false,
+          hasReachedGoal: false,
           body: [
             { x: start.x, y: start.y },
             { x: start.x - 1 >= 0 ? start.x - 1 : start.x, y: start.y },
@@ -266,9 +275,9 @@ export default function WormGame() {
     }
   };
 
-  // 도착 판정 및 구글 시트에 CREATE 수행
-  const handleFinishGame = useCallback(
-    async (winnerWorm: WormState, timeSec: number) => {
+  // 플레이어 지렁이가 도착했을 때 게임 종료 및 구글 시트에 CREATE 수행
+  const handlePlayerFinish = useCallback(
+    async (timeSec: number, playerRank: number, firstColor: string) => {
       if (loopRef.current) clearInterval(loopRef.current);
       if (timerRef.current) clearInterval(timerRef.current);
 
@@ -279,20 +288,20 @@ export default function WormGame() {
         hour12: false,
       });
 
-      const isPlayer = winnerWorm.isPlayer;
-      const winnerName = isPlayer
-        ? `${playerName} (${WORMS.find((w) => w.key === winnerWorm.color)?.label.replace("\n", "")})`
-        : `AI 지렁이 (${WORMS.find((w) => w.key === winnerWorm.color)?.label.replace("\n", "")})`;
+      const playerColorKorean =
+        WORMS.find((w) => w.key === selectedColor)?.koreanName || selectedColor;
 
       setGameResult({
-        winner: winnerName,
-        isPlayerWin: isPlayer,
+        firstColorName: firstColor,
+        playerRank,
+        isPlayerFirst: playerRank === 1,
         time: timeSec,
         arrivalStr: arrivalFormatted,
         startTimeStr: startTimeStr || arrivalFormatted,
       });
 
-      // CREATE: 구글 시트에 행 추가 (timestamp: 시작시간, name: 이름, arrival: 도착시간, finish time: 걸린시간)
+      // 구글 시트 CREATE:
+      // 요청 사항: "구글 시트에 기록되는 이름을 도착점에 가장 먼저 도달한 색깔로 표시"
       try {
         await fetch("/api/records", {
           method: "POST",
@@ -300,7 +309,7 @@ export default function WormGame() {
           body: JSON.stringify({
             action: "create",
             timestamp: startTimeStr || arrivalFormatted,
-            name: playerName,
+            name: firstColor, // 가장 먼저 도달한 색깔 (예: "빨간색", "파란색" 등)
             arrival: arrivalFormatted,
             finishTime: `${timeSec}초`,
           }),
@@ -312,7 +321,7 @@ export default function WormGame() {
 
       setScreen("game_over");
     },
-    [playerName, startTimeStr, fetchRecords]
+    [selectedColor, startTimeStr, fetchRecords]
   );
 
   // Main game tick loop
@@ -327,17 +336,19 @@ export default function WormGame() {
     loopRef.current = setInterval(() => {
       const currentGoal = goalRef.current;
       const curWorms = [...wormsRef.current];
-      let ended = false;
-      let winner: WormState | null = null;
+      let playerJustArrived = false;
+      let playerRank = 1;
 
       const nextWorms = curWorms.map((worm) => {
-        if (!worm.alive || ended) return worm;
+        // 이미 도착했거나 죽은 지렁이는 위치 유지
+        if (!worm.alive || worm.hasReachedGoal) return worm;
 
         let nextDir = worm.direction;
 
         if (worm.isPlayer) {
           nextDir = directionRef.current;
         } else {
+          // AI 움직임: 목표점 방향으로 접근
           const head = worm.body[0];
           const candidateDirs = [
             { x: 1, y: 0 },
@@ -369,6 +380,7 @@ export default function WormGame() {
         const head = worm.body[0];
         const newHead = { x: head.x + nextDir.x, y: head.y + nextDir.y };
 
+        // 벽 충돌 검사
         if (
           newHead.x < 0 ||
           newHead.x >= GRID_SIZE ||
@@ -378,9 +390,33 @@ export default function WormGame() {
           return { ...worm, alive: false };
         }
 
-        if (newHead.x === currentGoal.x && newHead.y === currentGoal.y) {
-          ended = true;
-          winner = worm;
+        // 도착점 도달 검사!
+        const reachedGoal =
+          newHead.x === currentGoal.x && newHead.y === currentGoal.y;
+
+        if (reachedGoal) {
+          arrivalCountRef.current += 1;
+          const currentRank = arrivalCountRef.current;
+          const wormColorName =
+            WORMS.find((w) => w.key === worm.color)?.koreanName || worm.color;
+
+          // 가장 먼저 도달한 색깔 기록
+          if (!firstArrivedColorRef.current) {
+            firstArrivedColorRef.current = wormColorName;
+          }
+
+          // 플레이어 지렁이가 도착했을 때만 게임 종료 트리거!
+          if (worm.isPlayer) {
+            playerJustArrived = true;
+            playerRank = currentRank;
+          }
+
+          return {
+            ...worm,
+            body: [newHead, ...worm.body.slice(0, -1)],
+            hasReachedGoal: true,
+            goalRank: currentRank,
+          };
         }
 
         const newBody = [newHead, ...worm.body.slice(0, -1)];
@@ -389,15 +425,16 @@ export default function WormGame() {
           ...worm,
           body: newBody,
           direction: nextDir,
-          won: ended && winner === worm,
         };
       });
 
       setWorms(nextWorms);
 
-      if (ended && winner) {
+      // 사용자가 선택한 지렁이가 도착했을 때 게임 종료!
+      if (playerJustArrived) {
         const timeSec = Math.floor((Date.now() - startTime) / 1000);
-        handleFinishGame(winner, timeSec);
+        const firstColor = firstArrivedColorRef.current || "알 수 없음";
+        handlePlayerFinish(timeSec, playerRank, firstColor);
       }
     }, 180);
 
@@ -405,7 +442,7 @@ export default function WormGame() {
       if (loopRef.current) clearInterval(loopRef.current);
       if (timerRef.current) clearInterval(timerRef.current);
     };
-  }, [screen, handleFinishGame]);
+  }, [screen, handlePlayerFinish]);
 
   return (
     <div className="min-h-screen bg-neutral-100 flex flex-col items-center justify-center p-4 select-none font-sans text-neutral-800">
@@ -446,7 +483,7 @@ export default function WormGame() {
         </div>
       )}
 
-      {/* 2. 메인 메뉴 화면 (첨부 이미지 레이아웃 일치) */}
+      {/* 2. 메인 메뉴 화면 */}
       {screen === "menu" && (
         <div className="w-full max-w-4xl flex flex-col items-center">
           {/* 상단 3개 버튼 */}
@@ -544,16 +581,21 @@ export default function WormGame() {
         <div className="flex flex-col items-center w-full max-w-xl">
           <div className="w-full flex justify-between items-center bg-white border border-neutral-300 px-4 py-2 mb-3 text-sm">
             <div>
-              시작시간: <span className="font-mono text-neutral-600">{startTimeStr}</span> |{" "}
-              <span className="font-bold text-neutral-900">{playerName}</span> (
+              시작: <span className="font-mono text-neutral-600">{startTimeStr}</span> |{" "}
+              내 지렁이:{" "}
               <span
+                className="font-bold"
                 style={{
                   color: WORMS.find((w) => w.key === selectedColor)?.colorCode,
                 }}
               >
-                ●
+                ● {WORMS.find((w) => w.key === selectedColor)?.koreanName}
               </span>
-              )
+              {firstArrivedColorRef.current && (
+                <span className="ml-2 text-xs text-amber-600 font-medium">
+                  (1등: {firstArrivedColorRef.current} 도착 완료!)
+                </span>
+              )}
             </div>
             <div className="font-mono text-base font-semibold text-neutral-800">
               ⏱ {elapsedTime}초
@@ -636,8 +678,10 @@ export default function WormGame() {
           </div>
 
           <div className="mt-4 flex flex-col items-center gap-2">
-            <span className="text-xs text-neutral-500">
-              방향키 (↑, ↓, ←, →) 또는 WASD 키로 조작하여 도착점까지 이동하세요!
+            <span className="text-xs text-neutral-600 font-medium">
+              내 지렁이(
+              {WORMS.find((w) => w.key === selectedColor)?.koreanName})가
+              도착점에 도착할 때까지 게임이 계속 진행됩니다!
             </span>
           </div>
         </div>
@@ -647,19 +691,29 @@ export default function WormGame() {
       {screen === "game_over" && gameResult && (
         <div className="w-full max-w-md bg-white border border-neutral-400 p-8 flex flex-col items-center text-center shadow-lg">
           <div className="text-4xl mb-3">
-            {gameResult.isPlayerWin ? "🏆" : "🏁"}
+            {gameResult.isPlayerFirst ? "🥇" : "🏁"}
           </div>
           <h2 className="text-3xl font-bold mb-2 text-neutral-900">
-            {gameResult.isPlayerWin ? "도착 성공!" : "게임 종료"}
+            {gameResult.isPlayerFirst ? "1등으로 도착!" : "도착 완료 (게임 종료)"}
           </h2>
           <p className="text-base text-neutral-700 mb-4">
-            1등 도착:{" "}
+            가장 먼저 도달한 색깔:{" "}
             <span className="font-bold text-neutral-950">
-              {gameResult.winner}
+              {gameResult.firstColorName}
+            </span>{" "}
+            <br />
+            <span className="text-xs text-neutral-500">
+              (내 지렁이 순위: {gameResult.playerRank}등)
             </span>
           </p>
 
           <div className="w-full bg-neutral-100 p-4 border border-neutral-200 mb-6 text-xs text-neutral-700 space-y-1.5 text-left">
+            <div className="flex justify-between">
+              <span className="text-neutral-500">구글 시트 기록 색상:</span>
+              <span className="font-bold text-blue-600">
+                {gameResult.firstColorName}
+              </span>
+            </div>
             <div className="flex justify-between">
               <span className="text-neutral-500">게임 시작 시간:</span>
               <span className="font-mono font-medium">{gameResult.startTimeStr}</span>
@@ -675,7 +729,7 @@ export default function WormGame() {
               </span>
             </div>
             <div className="pt-1 text-[11px] text-green-600 text-center font-medium">
-              ✓ 구글 시트에 기록이 저장되었습니다.
+              ✓ 1등 도착 색깔({gameResult.firstColorName})로 구글 시트에 저장되었습니다.
             </div>
           </div>
 
@@ -705,7 +759,7 @@ export default function WormGame() {
                 구글 시트 역대 기록
               </h2>
               <span className="text-xs text-neutral-500">
-                스프레드시트 실시간 동기화 데이터
+                스프레드시트 실시간 동기화 데이터 (이름 열 = 1등 도착 색깔)
               </span>
             </div>
             <button
@@ -730,7 +784,7 @@ export default function WormGame() {
                 <thead>
                   <tr className="bg-neutral-100 border-b border-neutral-300 text-neutral-600">
                     <th className="py-2 px-3 font-semibold">시작 시간</th>
-                    <th className="py-2 px-3 font-semibold">사용자 이름</th>
+                    <th className="py-2 px-3 font-semibold">1등 도착 색깔 (name)</th>
                     <th className="py-2 px-3 font-semibold">도착 시간</th>
                     <th className="py-2 px-3 font-semibold">걸린 시간</th>
                   </tr>
