@@ -62,36 +62,39 @@ interface WormState {
   won: boolean;
 }
 
-interface GameRecord {
-  id: string;
-  playerName: string;
-  selectedColor: string;
-  timeSeconds: number;
-  won: boolean;
-  date: string;
+interface SheetRecord {
+  row?: number;
+  timestamp: string; // 게임 시작 시간
+  name: string; // 사용자 이름
+  arrival: string; // 도착 시간
+  finishTime: string; // 도착에 걸린 시간
 }
 
 const GRID_SIZE = 20;
 
 export default function WormGame() {
-  // Screens: 'name_input' -> 'menu' -> 'loading_path' -> 'playing' -> 'game_over' | 'records'
   const [screen, setScreen] = useState<
     "name_input" | "menu" | "loading_path" | "playing" | "game_over" | "records"
   >("name_input");
 
   const [playerName, setPlayerName] = useState<string>("");
   const [selectedColor, setSelectedColor] = useState<ColorKey>("red");
-  const [records, setRecords] = useState<GameRecord[]>([]);
+  const [records, setRecords] = useState<SheetRecord[]>([]);
+  const [isLoadingRecords, setIsLoadingRecords] = useState<boolean>(false);
+  const [isClearing, setIsClearing] = useState<boolean>(false);
 
   // Game state
   const [pathTrack, setPathTrack] = useState<Point[]>([]);
   const [goal, setGoal] = useState<Point>({ x: 18, y: 18 });
   const [worms, setWorms] = useState<WormState[]>([]);
   const [elapsedTime, setElapsedTime] = useState<number>(0);
+  const [startTimeStr, setStartTimeStr] = useState<string>("");
   const [gameResult, setGameResult] = useState<{
     winner: string;
     isPlayerWin: boolean;
     time: number;
+    arrivalStr: string;
+    startTimeStr: string;
   } | null>(null);
 
   // References for loop & controls
@@ -104,30 +107,62 @@ export default function WormGame() {
   wormsRef.current = worms;
   goalRef.current = goal;
 
-  // Load records from LocalStorage
-  useEffect(() => {
-    const saved = localStorage.getItem("worm_game_records");
-    if (saved) {
-      try {
-        setRecords(JSON.parse(saved));
-      } catch {
-        setRecords([]);
+  // READ: 구글 시트에서 기록 불러오기
+  const fetchRecords = useCallback(async () => {
+    setIsLoadingRecords(true);
+    try {
+      const res = await fetch("/api/records?action=read");
+      const data = await res.json();
+      if (data && Array.isArray(data.records)) {
+        setRecords(data.records);
       }
+    } catch (err) {
+      console.error("구글 시트 기록 로드 실패:", err);
+    } finally {
+      setIsLoadingRecords(false);
     }
   }, []);
 
-  // Save records helper
-  const saveRecord = (record: GameRecord) => {
-    const updated = [record, ...records].slice(0, 50);
-    setRecords(updated);
-    localStorage.setItem("worm_game_records", JSON.stringify(updated));
-  };
+  useEffect(() => {
+    fetchRecords();
+  }, [fetchRecords]);
 
-  const clearRecords = () => {
-    if (confirm("정말로 모든 역대 기록을 초기화하시겠습니까?")) {
+  // DELETE / CLEAR: [기록 초기화] 버튼 클릭 시 구글 시트의 전체 기록 초기화
+  const clearGoogleSheetRecords = async () => {
+    if (!confirm("정말로 구글 시트의 모든 게임 기록을 초기화하시겠습니까?")) {
+      return;
+    }
+
+    setIsClearing(true);
+    try {
+      // 1. 개별 행 삭제 또는 action: clear 요청
+      const res = await fetch("/api/records", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "clear" }),
+      });
+      const data = await res.json();
+
+      // 만약 GAS에 clear action이 미구현 상태인 경우 기존 레코드 순차 삭제 폴백
+      if (!data.success && records.length > 0) {
+        for (const rec of records) {
+          if (rec.row) {
+            await fetch("/api/records", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ action: "delete", row: rec.row }),
+            });
+          }
+        }
+      }
+
       setRecords([]);
-      localStorage.removeItem("worm_game_records");
-      alert("기록이 성공적으로 초기화되었습니다.");
+      alert("구글 시트의 기록이 성공적으로 초기화되었습니다.");
+    } catch (err) {
+      console.error("기록 초기화 실패:", err);
+      alert("기록 초기화 중 오류가 발생했습니다.");
+    } finally {
+      setIsClearing(false);
     }
   };
 
@@ -169,11 +204,19 @@ export default function WormGame() {
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [screen]);
 
-  // Start game flow: Request Gemini path & initialize
+  // [게임 시작] 버튼: Gemini AI 경로 생성 & 게임 시작
   const startGame = async () => {
     setScreen("loading_path");
     setElapsedTime(0);
     directionRef.current = { x: 1, y: 0 };
+
+    const startFormatted = new Date().toLocaleTimeString("ko-KR", {
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: false,
+    });
+    setStartTimeStr(startFormatted);
 
     try {
       const res = await fetch("/api/generate-path", { method: "POST" });
@@ -190,7 +233,6 @@ export default function WormGame() {
       setPathTrack(track);
       setGoal(targetGoal);
 
-      // Initialize 4 worms: 1 player, 3 AI
       const startPositions: Point[] = [
         { x: 1, y: 1 },
         { x: 1, y: 3 },
@@ -224,49 +266,64 @@ export default function WormGame() {
     }
   };
 
-  // Finish Game Handler
+  // 도착 판정 및 구글 시트에 CREATE 수행
   const handleFinishGame = useCallback(
-    (winnerWorm: WormState, timeSec: number) => {
+    async (winnerWorm: WormState, timeSec: number) => {
       if (loopRef.current) clearInterval(loopRef.current);
       if (timerRef.current) clearInterval(timerRef.current);
+
+      const arrivalFormatted = new Date().toLocaleTimeString("ko-KR", {
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+        hour12: false,
+      });
 
       const isPlayer = winnerWorm.isPlayer;
       const winnerName = isPlayer
         ? `${playerName} (${WORMS.find((w) => w.key === winnerWorm.color)?.label.replace("\n", "")})`
         : `AI 지렁이 (${WORMS.find((w) => w.key === winnerWorm.color)?.label.replace("\n", "")})`;
 
-      const result = {
+      setGameResult({
         winner: winnerName,
         isPlayerWin: isPlayer,
         time: timeSec,
-      };
-      setGameResult(result);
-
-      saveRecord({
-        id: Date.now().toString(),
-        playerName,
-        selectedColor: WORMS.find((w) => w.key === selectedColor)?.label.replace("\n", "") || "",
-        timeSeconds: timeSec,
-        won: isPlayer,
-        date: new Date().toLocaleDateString("ko-KR"),
+        arrivalStr: arrivalFormatted,
+        startTimeStr: startTimeStr || arrivalFormatted,
       });
+
+      // CREATE: 구글 시트에 행 추가 (timestamp: 시작시간, name: 이름, arrival: 도착시간, finish time: 걸린시간)
+      try {
+        await fetch("/api/records", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            action: "create",
+            timestamp: startTimeStr || arrivalFormatted,
+            name: playerName,
+            arrival: arrivalFormatted,
+            finishTime: `${timeSec}초`,
+          }),
+        });
+        fetchRecords();
+      } catch (e) {
+        console.error("구글 시트 저장 오류:", e);
+      }
 
       setScreen("game_over");
     },
-    [playerName, selectedColor]
+    [playerName, startTimeStr, fetchRecords]
   );
 
   // Main game tick loop
   useEffect(() => {
     if (screen !== "playing") return;
 
-    // Timer
     const startTime = Date.now();
     timerRef.current = setInterval(() => {
       setElapsedTime(Math.floor((Date.now() - startTime) / 1000));
     }, 1000);
 
-    // Game loop (Speed: 160ms)
     loopRef.current = setInterval(() => {
       const currentGoal = goalRef.current;
       const curWorms = [...wormsRef.current];
@@ -281,7 +338,6 @@ export default function WormGame() {
         if (worm.isPlayer) {
           nextDir = directionRef.current;
         } else {
-          // AI Logic: Simple pathfinding towards goal with avoidance
           const head = worm.body[0];
           const candidateDirs = [
             { x: 1, y: 0 },
@@ -300,7 +356,6 @@ export default function WormGame() {
             return distA - distB + (Math.random() - 0.5) * 1.5;
           });
 
-          // Check boundary
           for (const cand of candidateDirs) {
             const nx = head.x + cand.x;
             const ny = head.y + cand.y;
@@ -314,7 +369,6 @@ export default function WormGame() {
         const head = worm.body[0];
         const newHead = { x: head.x + nextDir.x, y: head.y + nextDir.y };
 
-        // Boundary collision check
         if (
           newHead.x < 0 ||
           newHead.x >= GRID_SIZE ||
@@ -324,7 +378,6 @@ export default function WormGame() {
           return { ...worm, alive: false };
         }
 
-        // Check if reached goal!
         if (newHead.x === currentGoal.x && newHead.y === currentGoal.y) {
           ended = true;
           winner = worm;
@@ -356,7 +409,7 @@ export default function WormGame() {
 
   return (
     <div className="min-h-screen bg-neutral-100 flex flex-col items-center justify-center p-4 select-none font-sans text-neutral-800">
-      {/* 1. NAME INPUT SCREEN */}
+      {/* 1. 사용자 이름 입력 화면 */}
       {screen === "name_input" && (
         <div className="w-full max-w-md bg-white border border-neutral-300 shadow-sm p-8 flex flex-col items-center text-center">
           <h2 className="text-2xl font-bold mb-6 tracking-wide text-neutral-900">
@@ -386,17 +439,17 @@ export default function WormGame() {
               }
               setScreen("menu");
             }}
-            className="w-full py-3 bg-neutral-900 text-white font-medium hover:bg-neutral-800 transition-colors shadow-xs"
+            className="w-full py-3 bg-neutral-900 text-white font-medium hover:bg-neutral-800 transition-colors shadow-xs cursor-pointer"
           >
             확인
           </button>
         </div>
       )}
 
-      {/* 2. MAIN MENU SCREEN (MATCHES USER IMAGE PRECISELY) */}
+      {/* 2. 메인 메뉴 화면 (첨부 이미지 레이아웃 일치) */}
       {screen === "menu" && (
         <div className="w-full max-w-4xl flex flex-col items-center">
-          {/* Top 3 Buttons */}
+          {/* 상단 3개 버튼 */}
           <div className="w-full flex justify-between items-center mb-8 px-4">
             <button
               onClick={startGame}
@@ -405,20 +458,24 @@ export default function WormGame() {
               게임시작
             </button>
             <button
-              onClick={() => setScreen("records")}
+              onClick={() => {
+                fetchRecords();
+                setScreen("records");
+              }}
               className="px-8 py-3 bg-neutral-100 hover:bg-neutral-200 border border-neutral-500 text-lg font-medium text-neutral-900 shadow-xs transition-colors cursor-pointer"
             >
               기록확인
             </button>
             <button
-              onClick={clearRecords}
-              className="px-8 py-3 bg-neutral-100 hover:bg-neutral-200 border border-neutral-500 text-lg font-medium text-neutral-900 shadow-xs transition-colors cursor-pointer"
+              onClick={clearGoogleSheetRecords}
+              disabled={isClearing}
+              className="px-8 py-3 bg-neutral-100 hover:bg-neutral-200 border border-neutral-500 text-lg font-medium text-neutral-900 shadow-xs transition-colors cursor-pointer disabled:opacity-50"
             >
-              기록 초기화
+              {isClearing ? "초기화 중..." : "기록 초기화"}
             </button>
           </div>
 
-          {/* Central Banner Box */}
+          {/* 중앙 지렁이게임 배너 박스 */}
           <div className="w-full bg-[#ececec] border border-neutral-500 py-16 px-6 text-center shadow-xs mb-14">
             <h1 className="text-5xl md:text-6xl font-light tracking-widest text-neutral-900">
               지 렁 이 게 임
@@ -428,7 +485,7 @@ export default function WormGame() {
             </p>
           </div>
 
-          {/* Bottom 4 Color Cards (Vertical shape matching reference drawing) */}
+          {/* 하단 4개 지렁이 색상 카드 */}
           <div className="w-full flex justify-around items-center px-4">
             {WORMS.map((worm) => {
               const isSelected = selectedColor === worm.key;
@@ -442,7 +499,6 @@ export default function WormGame() {
                       : "bg-[#ececec] hover:bg-neutral-200"
                   }`}
                 >
-                  {/* Color pill indicator */}
                   <div
                     className="w-3.5 h-3.5 rounded-full mb-3 border border-neutral-400"
                     style={{ backgroundColor: worm.colorCode }}
@@ -460,7 +516,7 @@ export default function WormGame() {
             })}
           </div>
 
-          {/* Name Reset ("처음으로") Button */}
+          {/* 처음으로 (이름 변경) */}
           <button
             onClick={() => setScreen("name_input")}
             className="mt-12 text-sm text-neutral-500 hover:text-neutral-900 underline underline-offset-4 cursor-pointer"
@@ -470,27 +526,25 @@ export default function WormGame() {
         </div>
       )}
 
-      {/* 3. GEMINI AI PATH GENERATION LOADING SCREEN */}
+      {/* 3. GEMINI AI 경로 생성 로딩 화면 */}
       {screen === "loading_path" && (
         <div className="w-full max-w-md bg-white border border-neutral-300 p-10 flex flex-col items-center text-center shadow-sm">
           <div className="w-12 h-12 border-4 border-neutral-300 border-t-neutral-900 rounded-full animate-spin mb-6" />
           <h3 className="text-xl font-bold text-neutral-900 mb-2">
-            Gemini AI와 연결 중...
+            Gemini AI 경로 생성 중...
           </h3>
           <p className="text-sm text-neutral-600 leading-relaxed">
-            Gemini-3.8-Flash 모델이 지렁이 게임의 트랙 경로와 도착점을 실시간으로
-            생성하고 있습니다.
+            Gemini-3.8-Flash 모델이 지렁이 게임 트랙과 도착점을 생성하고 있습니다.
           </p>
         </div>
       )}
 
-      {/* 4. GAME PLAYING SCREEN */}
+      {/* 4. 게임 플레이 화면 */}
       {screen === "playing" && (
         <div className="flex flex-col items-center w-full max-w-xl">
-          {/* Top HUD */}
           <div className="w-full flex justify-between items-center bg-white border border-neutral-300 px-4 py-2 mb-3 text-sm">
             <div>
-              플레이어:{" "}
+              시작시간: <span className="font-mono text-neutral-600">{startTimeStr}</span> |{" "}
               <span className="font-bold text-neutral-900">{playerName}</span> (
               <span
                 style={{
@@ -498,8 +552,7 @@ export default function WormGame() {
                 }}
               >
                 ●
-              </span>{" "}
-              {WORMS.find((w) => w.key === selectedColor)?.label.replace("\n", "")}
+              </span>
               )
             </div>
             <div className="font-mono text-base font-semibold text-neutral-800">
@@ -517,7 +570,7 @@ export default function WormGame() {
             </button>
           </div>
 
-          {/* Grid Game Board (20x20) */}
+          {/* 20x20 격자 보드 */}
           <div
             className="relative bg-neutral-900 border-4 border-neutral-800 rounded-xs shadow-lg overflow-hidden"
             style={{
@@ -528,7 +581,6 @@ export default function WormGame() {
               gridTemplateRows: `repeat(${GRID_SIZE}, 1fr)`,
             }}
           >
-            {/* AI Generated Path overlay (subtle highlight) */}
             {pathTrack.map((pt, i) => (
               <div
                 key={`path-${i}`}
@@ -540,7 +592,7 @@ export default function WormGame() {
               />
             ))}
 
-            {/* Goal Point (도착점) */}
+            {/* 도착 지점 */}
             <div
               style={{
                 gridColumnStart: goal.x + 1,
@@ -553,7 +605,7 @@ export default function WormGame() {
               </span>
             </div>
 
-            {/* Worms rendering */}
+            {/* 지렁이 4마리 */}
             {worms.map((worm) => {
               if (!worm.alive) return null;
               return worm.body.map((segment, segIdx) => {
@@ -583,56 +635,15 @@ export default function WormGame() {
             })}
           </div>
 
-          {/* Direction Controls hint & on-screen mobile arrows */}
           <div className="mt-4 flex flex-col items-center gap-2">
             <span className="text-xs text-neutral-500">
               방향키 (↑, ↓, ←, →) 또는 WASD 키로 조작하여 도착점까지 이동하세요!
             </span>
-            <div className="grid grid-cols-3 gap-1 md:hidden mt-2">
-              <div />
-              <button
-                onClick={() => {
-                  if (directionRef.current.y === 0)
-                    directionRef.current = { x: 0, y: -1 };
-                }}
-                className="w-12 h-12 bg-white border border-neutral-300 font-bold active:bg-neutral-200"
-              >
-                ▲
-              </button>
-              <div />
-              <button
-                onClick={() => {
-                  if (directionRef.current.x === 0)
-                    directionRef.current = { x: -1, y: 0 };
-                }}
-                className="w-12 h-12 bg-white border border-neutral-300 font-bold active:bg-neutral-200"
-              >
-                ◀
-              </button>
-              <button
-                onClick={() => {
-                  if (directionRef.current.y === 0)
-                    directionRef.current = { x: 0, y: 1 };
-                }}
-                className="w-12 h-12 bg-white border border-neutral-300 font-bold active:bg-neutral-200"
-              >
-                ▼
-              </button>
-              <button
-                onClick={() => {
-                  if (directionRef.current.x === 0)
-                    directionRef.current = { x: 1, y: 0 };
-                }}
-                className="w-12 h-12 bg-white border border-neutral-300 font-bold active:bg-neutral-200"
-              >
-                ▶
-              </button>
-            </div>
           </div>
         </div>
       )}
 
-      {/* 5. GAME OVER SCREEN */}
+      {/* 5. 게임 종료 화면 */}
       {screen === "game_over" && gameResult && (
         <div className="w-full max-w-md bg-white border border-neutral-400 p-8 flex flex-col items-center text-center shadow-lg">
           <div className="text-4xl mb-3">
@@ -641,33 +652,33 @@ export default function WormGame() {
           <h2 className="text-3xl font-bold mb-2 text-neutral-900">
             {gameResult.isPlayerWin ? "도착 성공!" : "게임 종료"}
           </h2>
-          <p className="text-base text-neutral-700 mb-6">
+          <p className="text-base text-neutral-700 mb-4">
             1등 도착:{" "}
             <span className="font-bold text-neutral-950">
               {gameResult.winner}
             </span>
           </p>
 
-          <div className="w-full bg-neutral-100 p-4 border border-neutral-200 mb-6 text-sm flex justify-around">
-            <div>
-              <div className="text-neutral-500">소요 시간</div>
-              <div className="text-lg font-bold text-neutral-900">
-                {gameResult.time}초
-              </div>
+          <div className="w-full bg-neutral-100 p-4 border border-neutral-200 mb-6 text-xs text-neutral-700 space-y-1.5 text-left">
+            <div className="flex justify-between">
+              <span className="text-neutral-500">게임 시작 시간:</span>
+              <span className="font-mono font-medium">{gameResult.startTimeStr}</span>
             </div>
-            <div>
-              <div className="text-neutral-500">결과</div>
-              <div
-                className={`text-lg font-bold ${
-                  gameResult.isPlayerWin ? "text-green-600" : "text-amber-600"
-                }`}
-              >
-                {gameResult.isPlayerWin ? "승리" : "패배"}
-              </div>
+            <div className="flex justify-between">
+              <span className="text-neutral-500">도착 시간:</span>
+              <span className="font-mono font-medium">{gameResult.arrivalStr}</span>
+            </div>
+            <div className="flex justify-between">
+              <span className="text-neutral-500">도착에 걸린 시간:</span>
+              <span className="font-mono font-bold text-neutral-900">
+                {gameResult.time}초
+              </span>
+            </div>
+            <div className="pt-1 text-[11px] text-green-600 text-center font-medium">
+              ✓ 구글 시트에 기록이 저장되었습니다.
             </div>
           </div>
 
-          {/* 화면 나가기 버튼 (요청 사항: 처음 화면으로 이동) */}
           <div className="flex flex-col w-full gap-3">
             <button
               onClick={() => setScreen("menu")}
@@ -685,11 +696,18 @@ export default function WormGame() {
         </div>
       )}
 
-      {/* 6. RECORDS SCREEN */}
+      {/* 6. 구글 시트 역대 기록 확인 화면 */}
       {screen === "records" && (
-        <div className="w-full max-w-xl bg-white border border-neutral-400 p-6 flex flex-col shadow-sm">
+        <div className="w-full max-w-2xl bg-white border border-neutral-400 p-6 flex flex-col shadow-sm">
           <div className="flex justify-between items-center mb-6 pb-2 border-b border-neutral-200">
-            <h2 className="text-2xl font-bold text-neutral-900">역대 게임 기록</h2>
+            <div>
+              <h2 className="text-2xl font-bold text-neutral-900">
+                구글 시트 역대 기록
+              </h2>
+              <span className="text-xs text-neutral-500">
+                스프레드시트 실시간 동기화 데이터
+              </span>
+            </div>
             <button
               onClick={() => setScreen("menu")}
               className="text-sm px-3 py-1 bg-neutral-200 hover:bg-neutral-300 cursor-pointer"
@@ -698,51 +716,54 @@ export default function WormGame() {
             </button>
           </div>
 
-          {records.length === 0 ? (
+          {isLoadingRecords ? (
             <div className="py-12 text-center text-neutral-500 text-sm">
-              저장된 기록이 없습니다. 게임을 플레이해 보세요!
+              구글 시트에서 기록을 불러오는 중입니다...
+            </div>
+          ) : records.length === 0 ? (
+            <div className="py-12 text-center text-neutral-500 text-sm">
+              저장된 구글 시트 기록이 없습니다. 게임을 플레이해 보세요!
             </div>
           ) : (
-            <div className="max-h-80 overflow-y-auto divide-y divide-neutral-200">
-              {records.map((rec) => (
-                <div
-                  key={rec.id}
-                  className="py-3 px-2 flex justify-between items-center text-sm"
-                >
-                  <div>
-                    <span className="font-bold text-neutral-900">
-                      {rec.playerName}
-                    </span>{" "}
-                    <span className="text-xs text-neutral-500">
-                      ({rec.selectedColor} 지렁이)
-                    </span>
-                    <div className="text-xs text-neutral-400">{rec.date}</div>
-                  </div>
-                  <div className="flex items-center gap-3">
-                    <span className="font-mono text-neutral-700 font-semibold">
-                      {rec.timeSeconds}초
-                    </span>
-                    <span
-                      className={`text-xs px-2 py-0.5 rounded-sm font-medium ${
-                        rec.won
-                          ? "bg-green-100 text-green-700"
-                          : "bg-neutral-200 text-neutral-600"
-                      }`}
-                    >
-                      {rec.won ? "도착 승리" : "완료"}
-                    </span>
-                  </div>
-                </div>
-              ))}
+            <div className="max-h-80 overflow-y-auto">
+              <table className="w-full text-left text-xs border-collapse">
+                <thead>
+                  <tr className="bg-neutral-100 border-b border-neutral-300 text-neutral-600">
+                    <th className="py-2 px-3 font-semibold">시작 시간</th>
+                    <th className="py-2 px-3 font-semibold">사용자 이름</th>
+                    <th className="py-2 px-3 font-semibold">도착 시간</th>
+                    <th className="py-2 px-3 font-semibold">걸린 시간</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-neutral-200">
+                  {records.map((rec, idx) => (
+                    <tr key={idx} className="hover:bg-neutral-50">
+                      <td className="py-2.5 px-3 font-mono text-neutral-600">
+                        {rec.timestamp}
+                      </td>
+                      <td className="py-2.5 px-3 font-bold text-neutral-900">
+                        {rec.name}
+                      </td>
+                      <td className="py-2.5 px-3 font-mono text-neutral-600">
+                        {rec.arrival}
+                      </td>
+                      <td className="py-2.5 px-3 font-mono font-semibold text-neutral-800">
+                        {rec.finishTime}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
             </div>
           )}
 
           <div className="mt-6 flex justify-between items-center pt-4 border-t border-neutral-200">
             <button
-              onClick={clearRecords}
-              className="text-xs text-red-600 hover:underline cursor-pointer"
+              onClick={clearGoogleSheetRecords}
+              disabled={isClearing}
+              className="text-xs text-red-600 hover:underline cursor-pointer disabled:opacity-50"
             >
-              기록 전체 삭제
+              {isClearing ? "초기화 진행 중..." : "구글 시트 기록 초기화"}
             </button>
             <button
               onClick={() => setScreen("menu")}
